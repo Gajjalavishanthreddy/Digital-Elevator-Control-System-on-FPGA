@@ -1,0 +1,204 @@
+`timescale 1ns / 1ps
+//=============================================================
+// Digital Elevator Control System on FPGA
+// Single Press per Floor Button
+// FSM + Dual 7-Segment Display (Active-LOW)
+//-------------------------------------------------------------
+// Display 1 (seg_cur): shows current floor (always ON)
+// Display 2 (seg_req): shows requested floor (ON until reached)
+// Door open time: 1 second
+// Time per floor: 2 seconds
+// FPGA clock: 100 MHz
+//=============================================================
+
+module Elevator_controller(
+    input  wire clk,
+    input  wire reset,
+    input  wire btn_open,            // Manual door open button
+    input  wire floor0_key,          // Request floor 0
+    input  wire floor1_key,          // Request floor 1
+    input  wire floor2_key,          // Request floor 2
+    input  wire floor3_key,          // Request floor 3
+    output reg  [1:0] current_floor, // Current floor (0–3)
+    output reg  door_open,
+    output reg  moving,
+    output wire [6:0] seg_cur,       // 7-seg for current floor (active-LOW)
+    output wire [6:0] seg_req,       // 7-seg for requested floor (active-LOW)
+    output wire        req_enable    // Enable for 2nd display
+);
+
+    //=========================================================
+    // FSM States
+    //=========================================================
+    parameter IDLE      = 2'b00;
+    parameter MOVE_UP   = 2'b01;
+    parameter MOVE_DOWN = 2'b10;
+    parameter DOOR_OPEN = 2'b11;
+
+    reg [1:0] state, next_state;
+
+    //=========================================================
+    // Timing Parameters (for 100 MHz clock)
+    //=========================================================
+    parameter FLOOR_DELAY = 200_000_000;   // 2 seconds per floor
+    parameter DOOR_DELAY  = 100_000_000;   // 1 second door open time
+    integer counter;
+
+    //=========================================================
+    // Request Handling
+    //=========================================================
+    reg [1:0] target_floor;
+    reg request_active;
+
+    //=========================================================
+    // Edge detection for single press
+    //=========================================================
+    reg floor0_d, floor1_d, floor2_d, floor3_d;
+    wire floor0_edge = floor0_key & ~floor0_d;
+    wire floor1_edge = floor1_key & ~floor1_d;
+    wire floor2_edge = floor2_key & ~floor2_d;
+    wire floor3_edge = floor3_key & ~floor3_d;
+
+    //=========================================================
+    // Reset done flag to avoid request before reset complete
+    //=========================================================
+    reg reset_done;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            floor0_d <= 0; floor1_d <= 0; floor2_d <= 0; floor3_d <= 0;
+            reset_done <= 0;
+        end else begin
+            floor0_d <= floor0_key;
+            floor1_d <= floor1_key;
+            floor2_d <= floor2_key;
+            floor3_d <= floor3_key;
+            reset_done <= 1;
+        end
+    end
+
+    //=========================================================
+    // Sequential FSM and movement, request logic all in one
+    //=========================================================
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            state <= IDLE;
+            current_floor <= 0;    // Elevator stays at floor 0 after reset
+            counter <= 0;
+            door_open <= 0;
+            moving <= 0;
+            target_floor <= 0;
+            request_active <= 0;
+        end else begin
+            // Update state
+            state <= next_state;
+
+            // Handle floor request latching only in IDLE and no active request and reset done
+            if (reset_done && state == IDLE && !request_active) begin
+                if (floor0_edge && current_floor != 0) begin
+                    target_floor <= 0;
+                    request_active <= 1;
+                end else if (floor1_edge && current_floor != 1) begin
+                    target_floor <= 1;
+                    request_active <= 1;
+                end else if (floor2_edge && current_floor != 2) begin
+                    target_floor <= 2;
+                    request_active <= 1;
+                end else if (floor3_edge && current_floor != 3) begin
+                    target_floor <= 3;
+                    request_active <= 1;
+                end
+            end
+
+            case (state)
+                MOVE_UP, MOVE_DOWN: begin
+                    moving <= 1;
+                    door_open <= 0;
+                    counter <= counter + 1;
+                    if (counter >= FLOOR_DELAY) begin
+                        counter <= 0;
+                        if (state == MOVE_UP)
+                            current_floor <= current_floor + 1;
+                        else
+                            current_floor <= current_floor - 1;
+                    end
+                end
+
+                DOOR_OPEN: begin
+                    moving <= 0;
+                    door_open <= 1;
+                    counter <= counter + 1;
+                    if (counter >= DOOR_DELAY) begin
+                        counter <= 0;
+                        request_active <= 0; // Clear request after door opens
+                    end
+                end
+
+                default: begin
+                    moving <= 0;
+                    door_open <= 0;
+                    counter <= 0;
+                end
+            endcase
+        end
+    end
+
+    //=========================================================
+    // Combinational FSM Logic
+    //=========================================================
+    always @(*) begin
+        next_state = state;
+
+        case (state)
+            IDLE: begin
+                if (btn_open) next_state = DOOR_OPEN;
+                else if (request_active) begin
+                    if (target_floor > current_floor) next_state = MOVE_UP;
+                    else if (target_floor < current_floor) next_state = MOVE_DOWN;
+                    else next_state = DOOR_OPEN;
+                end
+            end
+
+            MOVE_UP: begin
+                if (current_floor == target_floor) next_state = DOOR_OPEN;
+            end
+
+            MOVE_DOWN: begin
+                if (current_floor == target_floor) next_state = DOOR_OPEN;
+            end
+
+            DOOR_OPEN: begin
+                if (counter >= DOOR_DELAY) next_state = IDLE;
+            end
+
+            default: next_state = IDLE;
+        endcase
+    end
+
+    //=========================================================
+    // 7-Segment Encoder (active-HIGH, inverted for active-LOW)
+    //=========================================================
+    function [6:0] seg_encode;
+        input [3:0] value;
+        begin
+            case(value)
+                4'd0: seg_encode = 7'b0111111;
+                4'd1: seg_encode = 7'b0000110;
+                4'd2: seg_encode = 7'b1011011;
+                4'd3: seg_encode = 7'b1001111;
+                4'd4: seg_encode = 7'b1100110;
+                4'd5: seg_encode = 7'b1101101;
+                4'd6: seg_encode = 7'b1111101;
+                4'd7: seg_encode = 7'b0000111;
+                4'd8: seg_encode = 7'b1111111;
+                4'd9: seg_encode = 7'b1101111;
+                default: seg_encode = 7'b0000000;
+            endcase
+        end
+    endfunction
+
+    assign seg_cur = ~seg_encode(current_floor);
+    assign seg_req = (current_floor != target_floor) ? ~seg_encode(target_floor) : 7'b1111111;
+    assign req_enable = (current_floor != target_floor);
+
+endmodule
